@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "w2vbert-fast"
+version = "0.1.0"
+description = "Fast, exact w2v-BERT 2.0 (Hugging Face Wav2Vec2BertModel) for training and inference"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = ["torch>=2.4", "transformers>=4.40"]
+
+[project.optional-dependencies]
+test = ["peft"]
+
+[project.urls]
+Homepage = "https://github.com/Wataru-Nakata/w2v-bert-fast"
+
+[tool.setuptools.packages.find]
+where = ["src"]
