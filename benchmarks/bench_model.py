@@ -53,10 +53,14 @@ def main():
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--pad", action="store_true", help="a padded batch: lengths spread over 50-100%% of frames")
+    parser.add_argument("--layers", type=int, default=None, help="keep only the first n encoder layers")
     args = parser.parse_args()
     from transformers import Wav2Vec2BertModel
 
     base = Wav2Vec2BertModel.from_pretrained("facebook/w2v-bert-2.0")
+    if args.layers is not None:
+        base.encoder.layers = base.encoder.layers[:args.layers]
+        base.config.num_hidden_layers = args.layers
     base.config.layerdrop = 0.0
     base.config.mask_time_prob = 0.0
     for frames in args.frames:
