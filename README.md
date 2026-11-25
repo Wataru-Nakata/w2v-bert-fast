@@ -21,6 +21,18 @@ with torch.no_grad():
                    attention_mask=inputs["attention_mask"]).last_hidden_state
 ```
 
+For inference, `InferenceEncoder` replays the compiled model from CUDA graphs, which matters most for short inputs
+and small batches (a 10 s clip through all 24 layers: 3.0 ms instead of 20 ms with the Hugging Face model):
+
+```python
+encoder = w2vbert_fast.InferenceEncoder("facebook/w2v-bert-2.0")  # or any Wav2Vec2BertModel
+hidden = encoder.from_waveforms(waveforms)               # [B, T, 1024] bf16; or encoder(features, attention_mask)
+
+# intermediate layers, e.g. a model that reads layer 8 and layer 20
+encoder = w2vbert_fast.InferenceEncoder("facebook/w2v-bert-2.0", num_layers=20, output_layers=[8, 20])
+hidden = encoder.from_waveforms(waveforms)               # {8: [B, T, 1024], 20: [B, T, 1024]}
+```
+
 A model you already have is sped up in place (its state-dict keys do not change), here keeping its first 8 layers:
 
 ```python
@@ -49,6 +61,11 @@ optimizers, `isinstance` checks and wrappers keep working.
 * **`compile=True`** compiles each encoder layer with `torch.compile`; the Triton kernels are registered custom
   operators, so the layers compile without graph breaks.
 * **`num_layers=n`** keeps only the first `n` layers, for models that read an intermediate layer.
+* **`InferenceEncoder`** captures the compiled model in a CUDA graph per input-shape bucket and replays it: the
+  number of frames is rounded up to a multiple of `frame_step` (25 frames, 0.5 s, by default) and the batch size to
+  the next of `batch_sizes` (1, 2, 4, 8, 16); the added frames are padding, masked as the feature extractor's is, so
+  valid positions are unchanged. All graphs share one memory pool. Results are copied out of the graph's buffers
+  (`copy=False` returns views valid until the next call).
 * **`extract_features`** computes the SeamlessM4T log-mel features (the `facebook/w2v-bert-2.0` preprocessor) in
   batch on any device.
 
@@ -70,7 +87,9 @@ The tests compare against the Hugging Face implementation:
 * the Triton attention against a float64 reference: fp32 with IEEE dot products to a relative error of `1e-3` (at
   every region boundary), and bf16 to `2e-2` at 300 and 1500 frames, with and without key lengths;
 * the convolution and the feature extractor against PyTorch and the Hugging Face extractor;
-* the custom operators with `torch.library.opcheck`.
+* the custom operators with `torch.library.opcheck`;
+* `InferenceEncoder`: graph replays against the same model run eagerly (shapes in any order, several output
+  layers, batches split into chunks), and the real checkpoint against the Hugging Face fp32 model.
 
 ```bash
 python -m unittest discover -s tests
@@ -100,6 +119,38 @@ this model's matrix shapes (24000 x 1024 x 4096 and the like; `benchmarks/bench_
 without the relative term 18-27% (backward and forward), so the matrix products and the attention floor alone put the ceiling near
 42% for inference and 36% for training on this GPU. An Nsight Systems timeline of back-to-back steps shows the GPU
 busy 98.5% of the time (`benchmarks/steady_state.py`): what remains is kernel time.
+
+### Inference with CUDA graphs
+
+Milliseconds per call of `InferenceEncoder` (results copied out), of the same model run eagerly
+(`optimize(model, compile=True)`) and of the Hugging Face model, bf16, one H200, padded batches as the feature
+extractor makes them. Short inputs are bound by kernel launches, which the graphs remove.
+
+| layers, batch x audio | Hugging Face | `optimize(model, compile=True)` | `InferenceEncoder` |
+|---|---|---|---|
+| 24, 1 x 3 s | 15.7 ms | 14.1 ms | **2.5 ms** |
+| 24, 1 x 10 s | 20.0 ms | 18.6 ms | **3.0 ms** |
+| 24, 1 x 30 s | 61.0 ms | 18.3 ms | **6.2 ms** |
+| 24, 1 x 120 s | 741 ms | 32.5 ms | **31.0 ms** |
+| 24, 16 x 10 s | 69.8 ms | 29.3 ms | **27.4 ms** |
+| 24, 16 x 30 s | 366 ms | 84.5 ms | **84.9 ms** |
+| 13, 1 x 3 s | | 7.4 ms | **1.4 ms** |
+| 13, 1 x 10 s | | 10.0 ms | **1.7 ms** |
+| 13, 1 x 30 s | | 10.1 ms | **3.3 ms** |
+| 13, 1 x 120 s | | 17.1 ms | **16.8 ms** |
+
+The outputs are those of the eagerly run model (relative distance to the Hugging Face fp32 model 0.015-0.020,
+against 0.020-0.025 for the Hugging Face model in bf16).
+
+A TensorRT engine of the same model (the Triton kernels as ahead-of-time plugins) was not faster on this GPU: its
+matrix products are no faster than cuBLAS's, and TensorRT's 48 KiB shared-memory limit for plugin kernels rules out
+the fastest attention tiles (24 layers, 16 x 30 s: 96 ms; 13 layers, 1 x 3-120 s: 2.1-20.4 ms).
+
+```bash
+python benchmarks/bench_inference.py --layers 24 --shapes 1x150 1x500 1x1500 1x6000 16x500 16x1500
+```
+
+### Benchmarks
 
 ```bash
 # one process per variant: compiled variants share dynamo's per-code recompile budget
