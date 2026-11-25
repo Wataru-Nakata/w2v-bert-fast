@@ -126,15 +126,26 @@ def probe(frames, workdir):
     import w2vbert_fast.triton_attention as ta
 
     source = pathlib.Path(ta.__file__).read_text()
-    band = """    for start_n in range(a, b2, BAND_N):"""
-    tail = """    for start_n in range(full, kv_len, BAND_N):"""
-    variants = {
-        "full_kernel": source,
-        "no_band": source.replace(band, "    for start_n in range(a, a, BAND_N):"),
-        "no_tail": source.replace(tail, "    for start_n in range(full, full, BAND_N):"),
-        "far_only": source.replace(band, "    for start_n in range(a, a, BAND_N):").replace(
-            tail, "    for start_n in range(full, full, BAND_N):"),
-    }
+    # in-register variant: the per-distance scores of the row block from one tensor-core dot (q E^T, no global
+    # buffer), and the band bias gathered from them with tl.gather
+    qr = """    q = tl.load(Q + b * sq_b + h * sq_h + offs_m[:, None] * sq_t + offs_d[None, :], mask=row_ok[:, None], other=0.0)
+"""
+    qr_new = qr + """    offs_p = tl.arange(0, 128)
+    e_rel = tl.load(E_REL + offs_p[:, None] * HEAD_DIM + offs_d[None, :], mask=(offs_p < LEFT + RIGHT + 1)[:, None],
+                    other=0.0)
+    qr_tile = tl.dot(q, tl.trans(e_rel.to(q.dtype))) * qk_scale
+"""
+    gather = """        s = s * qk_scale + tl.load(bucket_row[:, None] + index, mask=row_ok[:, None], other=0.0)"""
+    call = """_forward_block(acc, l_i, m_i, q, k_base, v_base, sk_t, sv_t, bucket_row, offs_m, offs_band,"""
+    variants = {"full_kernel": source}
+    text = source.replace(qr, qr_new, 1)
+    text = text.replace("def _forward(Q, K, V, Bk, Lens, O, LSE,", "def _forward(Q, K, V, Bk, Lens, O, LSE, E_REL,", 1)
+    text = text.replace("    _forward[grid](query, key, value, buckets, lengths, out, lse,",
+                        "    _forward[grid](query, key, value, buckets, lengths, out, lse, embedding.contiguous(),", 1)
+    text = text.replace(gather, "        s = s * qk_scale + tl.gather(bucket_row, index, axis=1)", 1)
+    assert text.count(call) == 2, text.count(call)
+    text = text.replace(call, call.replace("bucket_row, offs_m", "qr_tile, offs_m"))
+    variants["register_gather"] = text
     batch, heads, dim = 16, 16, 64
     qkv = torch.randn(batch, frames, 3, heads, dim, device="cuda", dtype=torch.bfloat16)
     e = torch.randn(73, dim, device="cuda", dtype=torch.bfloat16)
@@ -146,6 +157,11 @@ def probe(frames, workdir):
         spec = importlib.util.spec_from_file_location(f"probe_{index}", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        with torch.no_grad():
+            check = module.fused_relative_key_attention_packed(qkv, e, 64, 8).float()
+            reference = ta.fused_relative_key_attention_packed(qkv, e, 64, 8).float()
+        print(json.dumps({"variant": name, "max_abs_diff_vs_package": float((check - reference).abs().max())}),
+              flush=True)
         for config in list(module._forward.configs):
             module._forward.configs = [config]
             module._forward.cache.clear()
